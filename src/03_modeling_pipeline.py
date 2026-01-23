@@ -12,6 +12,7 @@ import numpy as np
 import matplotlib.pyplot as plt
 import seaborn as sns
 from sklearn.linear_model import LogisticRegression
+from sklearn.svm import SVC
 from sklearn.metrics import (accuracy_score, precision_score, recall_score, 
                             f1_score, confusion_matrix, roc_auc_score, roc_curve,
                             matthews_corrcoef, average_precision_score, precision_recall_curve)
@@ -25,6 +26,15 @@ from scipy.stats import chi2
 import os
 import warnings
 warnings.filterwarnings('ignore')
+
+# Try to import arch library for GARCH models
+try:
+    from arch import arch_model
+    ARCH_AVAILABLE = True
+except ImportError:
+    ARCH_AVAILABLE = False
+    print("WARNING: arch library not available. GARCH models will be skipped.")
+    print("Install with: pip install arch")
 
 
 # McNemar's test implementation
@@ -87,16 +97,12 @@ df = df.sort_values('date').reset_index(drop=True)
 return_cols = [c for c in df.columns if '_Log_Return' in c]
 df['market_return'] = df[return_cols].mean(axis=1)
 
-# Create volatility target
+# Create volatility target (threshold will be calculated on training data only)
 df['volatility_abs'] = df['market_return'].abs()
-vol_threshold = df['volatility_abs'].quantile(0.75)
-df['volatility_high'] = (df['volatility_abs'] > vol_threshold).astype(int)
 df['next_volatility'] = df['volatility_abs'].shift(-1)
-df['next_volatility_high'] = df['volatility_high'].shift(-1)
+df = df.dropna(subset=['next_volatility', 'market_return'])
 
-df = df.dropna(subset=['next_volatility_high', 'market_return'])
-
-print(f"   Loaded {len(df):,} rows | Threshold: {vol_threshold*100:.2f}% | High vol: {df['next_volatility_high'].mean()*100:.1f}%")
+print(f"   Loaded {len(df):,} rows")
 
 # ============================================================
 # FEATURE ENGINEERING - MARKET-WIDE TECHNICAL INDICATORS
@@ -154,10 +160,11 @@ df['Market_Momentum_1d'] = df['market_return'].shift(1)
 df['Market_Momentum_5d'] = df['market_return'].rolling(5).mean().shift(1)
 
 # 6. Market Volume Ratio (if available)
+# CRITICAL: Use shift(1) to ensure no look-ahead bias - compare current to past 20-day average
 volume_cols = [c for c in df.columns if '_Volume' in c]
 if len(volume_cols) > 0:
     market_volume = df[volume_cols].mean(axis=1)
-    df['Market_Volume_Ratio'] = market_volume / (market_volume.rolling(20).mean() + 1e-8)
+    df['Market_Volume_Ratio'] = market_volume / (market_volume.rolling(20).mean().shift(1) + 1e-8)
 
 # Select market-wide technical features (only those that were successfully created)
 technical_features = [
@@ -183,31 +190,50 @@ all_features = technical_features + wsv_features
 if len(all_features) == 0:
     raise ValueError("No features available! Check data columns.")
 
-# Prepare data
-X_technical = df[technical_features].fillna(0) if len(technical_features) > 0 else pd.DataFrame(index=df.index)
-X_wsv = df[wsv_features].fillna(0)
-X_all = df[all_features].fillna(0)
-y = df['next_volatility_high'].fillna(0).astype(int).values
-dates = df['date'].values
-
 print(f"   Market-wide Technical: {len(technical_features)} features")
 print(f"   WSV: {len(wsv_features)} features")
 print(f"   Total: {len(all_features)} features")
 
 print("\n[3/22] Creating time-based splits...")
 
+# Define split indices BEFORE creating target variable
 n = len(df)
 train_end = int(n * 0.6)
 val_end = int(n * 0.8)
-train_idx = np.arange(0, train_end)
-val_idx = np.arange(train_end, val_end)
-test_idx = np.arange(val_end, n)
+
+# CRITICAL FIX: Calculate threshold ONLY on training data to prevent data leakage
+# Use iloc to get training data before any dropna operations
+vol_threshold = df.iloc[:train_end]['volatility_abs'].quantile(0.75)
+
+# Create target variable using threshold calculated on training data only
+df['volatility_high'] = (df['volatility_abs'] > vol_threshold).astype(int)
+df['next_volatility_high'] = df['volatility_high'].shift(-1)
+
+# Drop rows where target is NaN (last row will have NaN after shift)
+df = df.dropna(subset=['next_volatility_high'])
+
+# Recalculate indices after dropna (one row will be dropped)
+n_new = len(df)
+train_end_new = int(n_new * 0.6)
+val_end_new = int(n_new * 0.8)
+train_idx = np.arange(0, train_end_new)
+val_idx = np.arange(train_end_new, val_end_new)
+test_idx = np.arange(val_end_new, n_new)
+
+# Prepare data AFTER creating target variable
+X_technical = df[technical_features].fillna(0) if len(technical_features) > 0 else pd.DataFrame(index=df.index)
+X_wsv = df[wsv_features].fillna(0)
+X_all = df[all_features].fillna(0)
+y = df['next_volatility_high'].fillna(0).astype(int).values
+dates = df['date'].values
 
 # Split data
 X_tech_train, X_tech_val, X_tech_test = X_technical.iloc[train_idx], X_technical.iloc[val_idx], X_technical.iloc[test_idx]
 X_wsv_train, X_wsv_val, X_wsv_test = X_wsv.iloc[train_idx], X_wsv.iloc[val_idx], X_wsv.iloc[test_idx]
 X_all_train, X_all_val, X_all_test = X_all.iloc[train_idx], X_all.iloc[val_idx], X_all.iloc[test_idx]
 y_train, y_val, y_test = y[train_idx], y[val_idx], y[test_idx]
+
+print(f"   Threshold (train-only): {vol_threshold*100:.2f}% | Train high vol: {y_train.mean()*100:.1f}% | Val: {y_val.mean()*100:.1f}% | Test: {y_test.mean()*100:.1f}%")
 
 # Scale features
 scaler_tech = StandardScaler()
@@ -327,12 +353,17 @@ metrics_random['Features'] = 'None'
 
 print("\n[5/22] Persistence Model...")
 
-# Predict last day's volatility
-y_pred_persistence = df.loc[test_idx - 1, 'volatility_high'].fillna(0).astype(int).values
-# Handle first test sample
-if len(y_pred_persistence) < len(y_test):
-    y_pred_persistence = np.concatenate([[df.loc[train_idx[-1], 'volatility_high']], y_pred_persistence])
-y_pred_persistence = y_pred_persistence[:len(y_test)]
+# Predict last day's volatility (persistence: tomorrow = today)
+# For test set, use the previous day's volatility_high
+# test_idx[0] - 1 should be the last validation set index
+prev_indices = test_idx - 1
+# Ensure we don't go below 0
+prev_indices = np.maximum(prev_indices, 0)
+y_pred_persistence = df.loc[prev_indices, 'volatility_high'].fillna(0).astype(int).values
+
+# Ensure length matches
+if len(y_pred_persistence) != len(y_test):
+    y_pred_persistence = y_pred_persistence[:len(y_test)]
 
 metrics_persistence = calculate_comprehensive_metrics(y_test, y_pred_persistence, None, class_weights)
 metrics_persistence['Model'] = 'Persistence'
@@ -352,10 +383,196 @@ metrics_majority['Model'] = 'Majority Class'
 metrics_majority['Features'] = 'None'
 
 # ============================================================
+# BASELINE 3: GARCH MODELS (if arch library available)
+# ============================================================
+
+metrics_garch = None
+metrics_egarch = None
+metrics_gjrgarch = None
+y_pred_garch = None
+y_pred_egarch = None
+y_pred_gjrgarch = None
+y_proba_garch = None
+y_proba_egarch = None
+y_proba_gjrgarch = None
+
+if ARCH_AVAILABLE:
+    print("\n[7/22] GARCH Models...")
+    
+    # Prepare returns for GARCH models (need full time series)
+    # Use market returns from training + validation + test for model fitting
+    # But only predict on test set
+    
+    # Get returns for all periods
+    returns_train = df.loc[train_idx, 'market_return'].values
+    returns_val = df.loc[val_idx, 'market_return'].values
+    returns_test = df.loc[test_idx, 'market_return'].values
+    
+    # For training GARCH, use train+val data
+    returns_train_val = np.concatenate([returns_train, returns_val])
+    
+    # Helper function to fit GARCH and predict (OPTIMIZED VERSION)
+    def fit_garch_and_predict(returns_train_val, returns_test, model_type='GARCH'):
+        """Fit GARCH model and predict volatility using rolling window (much faster)."""
+        try:
+            import time
+            start_time = time.time()
+            
+            # Forecast volatility for test period using rolling window
+            # Instead of refitting for each point, we use expanding window with periodic refits
+            forecasts = []
+            all_returns = np.concatenate([returns_train_val, returns_test]) * 100
+            
+            # Refit every N points to balance accuracy and speed (N=50 means refit ~15 times instead of 770)
+            refit_interval = 50  # Refit every 50 test points
+            
+            for i in range(len(returns_test)):
+                # Determine if we should refit
+                should_refit = (i % refit_interval == 0) or (i == 0)
+                
+                # Get data up to current test point
+                data_to_use = all_returns[:len(returns_train_val) + i]
+                
+                if should_refit or i == 0:
+                    # Refit model with updated data
+                    try:
+                        if model_type == 'GARCH':
+                            temp_model = arch_model(data_to_use, vol='GARCH', p=1, q=1, dist='normal')
+                        elif model_type == 'EGARCH':
+                            temp_model = arch_model(data_to_use, vol='EGARCH', p=1, q=1, dist='normal')
+                        elif model_type == 'GJR-GARCH':
+                            temp_model = arch_model(data_to_use, vol='GARCH', p=1, o=1, q=1, dist='normal')
+                        else:
+                            return None, None
+                        
+                        temp_fitted = temp_model.fit(disp='off', show_warning=False, update_freq=0)
+                        # Store fitted model for reuse
+                        last_fitted = temp_fitted
+                    except Exception as e:
+                        # If fitting fails, try to use last fitted model or fallback
+                        if 'last_fitted' not in locals():
+                            # Fallback: use simple volatility estimate
+                            forecasts.append(np.std(data_to_use) / 100)
+                            continue
+                
+                # Forecast one-step ahead using stored model
+                try:
+                    forecast = last_fitted.forecast(horizon=1, reindex=False)
+                    # Get conditional volatility (annualized, convert back to daily)
+                    vol_forecast = np.sqrt(forecast.variance.values[-1, 0]) / 100
+                    forecasts.append(vol_forecast)
+                except:
+                    # If forecast fails, use last known volatility
+                    if len(forecasts) > 0:
+                        forecasts.append(forecasts[-1])
+                    else:
+                        forecasts.append(np.std(data_to_use) / 100)
+            
+            elapsed = time.time() - start_time
+            print(f"      ({elapsed:.1f}s)")
+            
+            vol_forecasts = np.array(forecasts)
+            
+            # Convert to binary predictions using threshold
+            y_pred_binary = (vol_forecasts > vol_threshold).astype(int)
+            
+            # Create probability estimates (distance from threshold)
+            # Use sigmoid-like transformation
+            distance = (vol_forecasts - vol_threshold) / (vol_threshold + 1e-6)
+            y_proba = 1 / (1 + np.exp(-distance))
+            
+            return y_pred_binary, y_proba
+            
+        except Exception as e:
+            print(f"   Error fitting {model_type}: {str(e)}")
+            return None, None
+    
+    # Fit GARCH(1,1)
+    print("   Fitting GARCH(1,1)...")
+    y_pred_garch, y_proba_garch = fit_garch_and_predict(returns_train_val, returns_test, 'GARCH')
+    if y_pred_garch is not None:
+        metrics_garch = calculate_comprehensive_metrics(y_test, y_pred_garch, y_proba_garch, class_weights)
+        metrics_garch['Model'] = 'GARCH(1,1)'
+        metrics_garch['Features'] = 'Historical Returns'
+        print(f"   GARCH(1,1): F1={metrics_garch['F1_Score']:.4f}, MCC={metrics_garch['MCC']:.4f}")
+    
+    # Fit EGARCH(1,1)
+    print("   Fitting EGARCH(1,1)...")
+    y_pred_egarch, y_proba_egarch = fit_garch_and_predict(returns_train_val, returns_test, 'EGARCH')
+    if y_pred_egarch is not None:
+        metrics_egarch = calculate_comprehensive_metrics(y_test, y_pred_egarch, y_proba_egarch, class_weights)
+        metrics_egarch['Model'] = 'EGARCH(1,1)'
+        metrics_egarch['Features'] = 'Historical Returns'
+        print(f"   EGARCH(1,1): F1={metrics_egarch['F1_Score']:.4f}, MCC={metrics_egarch['MCC']:.4f}")
+    
+    # Fit GJR-GARCH(1,1,1)
+    print("   Fitting GJR-GARCH(1,1,1)...")
+    y_pred_gjrgarch, y_proba_gjrgarch = fit_garch_and_predict(returns_train_val, returns_test, 'GJR-GARCH')
+    if y_pred_gjrgarch is not None:
+        metrics_gjrgarch = calculate_comprehensive_metrics(y_test, y_pred_gjrgarch, y_proba_gjrgarch, class_weights)
+        metrics_gjrgarch['Model'] = 'GJR-GARCH(1,1,1)'
+        metrics_gjrgarch['Features'] = 'Historical Returns'
+        print(f"   GJR-GARCH(1,1,1): F1={metrics_gjrgarch['F1_Score']:.4f}, MCC={metrics_gjrgarch['MCC']:.4f}")
+else:
+    print("\n[7/22] GARCH Models (skipped - arch library not available)")
+
+# ============================================================
+# BASELINE 4: HAR (Heterogeneous Autoregressive) MODEL
+# ============================================================
+
+print("\n[8/22] HAR Model...")
+
+# HAR model: volatility_t = a + b1*volatility_t-1 + b2*volatility_t-5 + b3*volatility_t-22
+# Where volatility_t-5 is 5-day average, volatility_t-22 is 22-day average
+
+# Create HAR features from historical volatility
+def create_har_features(volatility_series):
+    """Create HAR features: daily, 5-day, 22-day averages."""
+    har_features = pd.DataFrame(index=volatility_series.index)
+    har_features['vol_daily'] = volatility_series.shift(1)  # Previous day
+    har_features['vol_5d'] = volatility_series.rolling(5).mean().shift(1)  # 5-day average
+    har_features['vol_22d'] = volatility_series.rolling(22).mean().shift(1)  # 22-day average
+    return har_features.bfill().fillna(0)
+
+# Create HAR features for all data
+har_features_all = create_har_features(df['volatility_abs'])
+
+# Split HAR features
+har_train = har_features_all.iloc[train_idx]
+har_val = har_features_all.iloc[val_idx]
+har_test = har_features_all.iloc[test_idx]
+
+# Fit HAR model using linear regression (OLS)
+from sklearn.linear_model import LinearRegression
+
+# Fit on train+val data
+har_model = LinearRegression()
+har_train_val = pd.concat([har_train, har_val])
+y_train_val_vol = df.loc[np.concatenate([train_idx, val_idx]), 'volatility_abs'].values
+
+har_model.fit(har_train_val, y_train_val_vol)
+
+# Predict volatility on test set
+vol_forecasts_har = har_model.predict(har_test)
+vol_forecasts_har = np.maximum(vol_forecasts_har, 0)  # Ensure non-negative
+
+# Convert to binary predictions
+y_pred_har = (vol_forecasts_har > vol_threshold).astype(int)
+
+# Create probability estimates
+distance_har = (vol_forecasts_har - vol_threshold) / (vol_threshold + 1e-6)
+y_proba_har = 1 / (1 + np.exp(-distance_har))
+
+metrics_har = calculate_comprehensive_metrics(y_test, y_pred_har, y_proba_har, class_weights)
+metrics_har['Model'] = 'HAR'
+metrics_har['Features'] = 'Historical Volatility'
+print(f"   HAR: F1={metrics_har['F1_Score']:.4f}, MCC={metrics_har['MCC']:.4f}")
+
+# ============================================================
 # EXPERIMENT 5.2: LOGISTIC REGRESSION (TECHNICAL)
 # ============================================================
 
-print("\n[7/22] LR (Technical)...")
+print("\n[9/22] LR (Technical)...")
 
 lr_tech = LogisticRegression(max_iter=1000, class_weight='balanced', random_state=42)
 lr_tech.fit(X_tech_train_scaled, y_train)
@@ -371,7 +588,7 @@ metrics_lr_tech['Features'] = 'Technical'
 # EXPERIMENT 5.3: XGBOOST (TECHNICAL)
 # ============================================================
 
-print("\n[8/22] XGBoost (Technical)...")
+print("\n[10/22] XGBoost (Technical)...")
 
 xgb_tech = xgb.XGBClassifier(
     n_estimators=100, max_depth=5, learning_rate=0.1,
@@ -393,7 +610,7 @@ metrics_xgb_tech['Features'] = 'Technical'
 # BASELINE 3: RANDOM FOREST
 # ============================================================
 
-print("\n[9/22] Random Forest...")
+print("\n[11/22] Random Forest...")
 
 rf = RandomForestClassifier(
     n_estimators=100, max_depth=10, class_weight='balanced',
@@ -411,7 +628,7 @@ metrics_rf['Features'] = 'Technical+WSV'
 # BASELINE 4: k-NN
 # ============================================================
 
-print("\n[10/22] k-NN...")
+print("\n[12/22] k-NN...")
 
 knn = KNeighborsClassifier(n_neighbors=5, weights='distance')
 knn.fit(X_all_train_scaled, y_train)
@@ -426,7 +643,7 @@ metrics_knn['Features'] = 'Technical+WSV'
 # EXPERIMENT 6.1: LOGISTIC REGRESSION (WSV)
 # ============================================================
 
-print("\n[11/22] LR (WSV)...")
+print("\n[13/22] LR (WSV)...")
 
 lr_wsv = LogisticRegression(max_iter=1000, class_weight='balanced', random_state=42)
 lr_wsv.fit(X_wsv_train_scaled, y_train)
@@ -442,7 +659,7 @@ metrics_lr_wsv['Features'] = 'WSV'
 # EXPERIMENT 6.2: XGBOOST (WSV)
 # ============================================================
 
-print("\n[12/22] XGBoost (WSV)...")
+print("\n[14/22] XGBoost (WSV)...")
 
 xgb_wsv = xgb.XGBClassifier(
     n_estimators=100, max_depth=5, learning_rate=0.1,
@@ -464,21 +681,31 @@ metrics_xgb_wsv['Features'] = 'WSV'
 # EXPERIMENT 7.1: LOGISTIC REGRESSION (FUSION)
 # ============================================================
 
-print("\n[13/22] LR Fusion (RFE)...")
+print("\n[15/22] LR Fusion (RFE)...")
+
+# CRITICAL FIX: Use nested cross-validation on training data only to select feature count
+# This prevents data leakage from using validation set for model selection
+from sklearn.model_selection import cross_val_score
 
 base_lr = LogisticRegression(class_weight='balanced', solver='liblinear', random_state=42, max_iter=1000)
 best_rfe_f1, best_rfe_n, best_rfe, best_rfe_model = 0, 10, None, None
 
+# Use 5-fold CV on training data to select optimal feature count
 for n_features in [8, 10, 12, 15]:
     rfe = RFE(estimator=base_lr, n_features_to_select=n_features, step=1)
     rfe.fit(X_all_train_scaled, y_train)
     X_train_rfe = rfe.transform(X_all_train_scaled)
-    X_val_rfe = rfe.transform(X_all_val_scaled)
-    lr_rfe = LogisticRegression(class_weight='balanced', C=0.1, random_state=42, max_iter=1000)
-    lr_rfe.fit(X_train_rfe, y_train)
-    f1_rfe_val = f1_score(y_val, lr_rfe.predict(X_val_rfe), average='macro', zero_division=0)
-    if f1_rfe_val > best_rfe_f1:
-        best_rfe_f1, best_rfe_n, best_rfe, best_rfe_model = f1_rfe_val, n_features, rfe, lr_rfe
+    
+    # Use cross-validation on training data only (not validation set)
+    lr_rfe_cv = LogisticRegression(class_weight='balanced', C=0.1, random_state=42, max_iter=1000)
+    cv_scores = cross_val_score(lr_rfe_cv, X_train_rfe, y_train, cv=5, scoring='f1_macro', n_jobs=-1)
+    f1_rfe_cv_mean = cv_scores.mean()
+    
+    if f1_rfe_cv_mean > best_rfe_f1:
+        best_rfe_f1, best_rfe_n, best_rfe = f1_rfe_cv_mean, n_features, rfe
+        # Train final model on full training set
+        best_rfe_model = LogisticRegression(class_weight='balanced', C=0.1, random_state=42, max_iter=1000)
+        best_rfe_model.fit(X_train_rfe, y_train)
 
 selected_mask = best_rfe.support_
 selected_features = np.array(all_features)[selected_mask]
@@ -486,7 +713,7 @@ selected_feature_types = ['Technical' if f in technical_features else 'WSV' for 
 n_tech_selected = sum(1 for t in selected_feature_types if t == 'Technical')
 n_wsv_selected = sum(1 for t in selected_feature_types if t == 'WSV')
 
-print(f"   Selected {best_rfe_n} features ({n_tech_selected} Tech, {n_wsv_selected} WSV) | Val F1={best_rfe_f1:.4f}")
+print(f"   Selected {best_rfe_n} features ({n_tech_selected} Tech, {n_wsv_selected} WSV) | CV F1={best_rfe_f1:.4f}")
 
 # Transform test data and evaluate
 X_test_rfe = best_rfe.transform(X_all_test_scaled)
@@ -509,7 +736,7 @@ selected_features_list = selected_features
 # EXPERIMENT 7.2: XGBOOST (FUSION)
 # ============================================================
 
-print("\n[14/22] XGBoost (Fusion)...")
+print("\n[16/22] XGBoost (Fusion)...")
 
 xgb_fusion = xgb.XGBClassifier(
     n_estimators=100, max_depth=5, learning_rate=0.1,
@@ -528,25 +755,94 @@ metrics_xgb_fusion['Model'] = 'XGBoost'
 metrics_xgb_fusion['Features'] = 'Technical+WSV'
 
 # ============================================================
+# EXPERIMENT 5.4: SVM (TECHNICAL)
+# ============================================================
+
+print("\n[17/25] SVM (Technical)...")
+
+svm_tech = SVC(kernel='rbf', C=1.0, gamma='scale', class_weight='balanced', 
+               probability=True, random_state=42)
+svm_tech.fit(X_tech_train_scaled, y_train)
+
+y_pred_svm_tech_test = svm_tech.predict(X_tech_test_scaled)
+y_proba_svm_tech_test = svm_tech.predict_proba(X_tech_test_scaled)[:, 1]
+
+metrics_svm_tech = calculate_comprehensive_metrics(y_test, y_pred_svm_tech_test, y_proba_svm_tech_test, class_weights)
+metrics_svm_tech['Model'] = 'SVM'
+metrics_svm_tech['Features'] = 'Technical'
+
+# ============================================================
+# EXPERIMENT 6.3: SVM (WSV)
+# ============================================================
+
+print("\n[18/25] SVM (WSV)...")
+
+svm_wsv = SVC(kernel='rbf', C=1.0, gamma='scale', class_weight='balanced', 
+              probability=True, random_state=42)
+svm_wsv.fit(X_wsv_train_scaled, y_train)
+
+y_pred_svm_wsv_test = svm_wsv.predict(X_wsv_test_scaled)
+y_proba_svm_wsv_test = svm_wsv.predict_proba(X_wsv_test_scaled)[:, 1]
+
+metrics_svm_wsv = calculate_comprehensive_metrics(y_test, y_pred_svm_wsv_test, y_proba_svm_wsv_test, class_weights)
+metrics_svm_wsv['Model'] = 'SVM'
+metrics_svm_wsv['Features'] = 'WSV'
+
+# ============================================================
+# EXPERIMENT 7.3: SVM (FUSION)
+# ============================================================
+
+print("\n[19/25] SVM (Fusion)...")
+
+svm_fusion = SVC(kernel='rbf', C=1.0, gamma='scale', class_weight='balanced', 
+                 probability=True, random_state=42)
+svm_fusion.fit(X_all_train_scaled, y_train)
+
+y_pred_svm_fusion_test = svm_fusion.predict(X_all_test_scaled)
+y_proba_svm_fusion_test = svm_fusion.predict_proba(X_all_test_scaled)[:, 1]
+
+metrics_svm_fusion = calculate_comprehensive_metrics(y_test, y_pred_svm_fusion_test, y_proba_svm_fusion_test, class_weights)
+metrics_svm_fusion['Model'] = 'SVM'
+metrics_svm_fusion['Features'] = 'Technical+WSV'
+
+# ============================================================
 # TABLE 8.1: COMPREHENSIVE MODEL COMPARISON
 # ============================================================
 
-print("\n[15/22] Generating Table 8.1: Main Model Comparison...")
+print("\n[18/25] Generating Table 8.1: Main Model Comparison...")
 
 # All models
 all_results = [
     metrics_random,
     metrics_persistence,
     metrics_majority,
+]
+
+# Add GARCH models if available
+if metrics_garch is not None:
+    all_results.append(metrics_garch)
+if metrics_egarch is not None:
+    all_results.append(metrics_egarch)
+if metrics_gjrgarch is not None:
+    all_results.append(metrics_gjrgarch)
+
+# Add HAR model
+all_results.append(metrics_har)
+
+# Add main models
+all_results.extend([
     metrics_lr_tech,
     metrics_xgb_tech,
+    metrics_svm_tech,
     metrics_rf,
     metrics_knn,
     metrics_lr_wsv,
     metrics_xgb_wsv,
+    metrics_svm_wsv,
     metrics_lr_fusion,
-    metrics_xgb_fusion
-]
+    metrics_xgb_fusion,
+    metrics_svm_fusion
+])
 
 table_8_1 = pd.DataFrame(all_results)
 
@@ -597,7 +893,7 @@ table_8_1.to_csv('/kaggle/working/modeling_tables/table_8_1_comprehensive_compar
 # TABLE 8.2: IMPROVEMENT ANALYSIS
 # ============================================================
 
-print("\n[16/22] Table II: Comparative Performance (vs Persistence Baseline)...")
+print("\n[21/25] Table II: Comparative Performance (vs Persistence Baseline)...")
 
 # Helper: McNemar-based p-value for Model vs Baseline (Persistence)
 def get_p_value(y_true, y_model, y_baseline):
@@ -639,10 +935,12 @@ y_pred_persist = y_pred_persistence
 y_pred_fusion = y_pred_lr_fusion_test
 y_pred_wsv = y_pred_lr_wsv_test
 y_pred_tech = y_pred_lr_tech_test
+y_pred_svm_wsv = y_pred_svm_wsv_test
 
 p_fusion = get_p_value(y_true_test, y_pred_fusion, y_pred_persist)
 p_wsv = get_p_value(y_true_test, y_pred_wsv, y_pred_persist)
 p_tech = get_p_value(y_true_test, y_pred_tech, y_pred_persist)
+p_svm_wsv = get_p_value(y_true_test, y_pred_svm_wsv, y_pred_persist)
 
 table2_rows = [
     {
@@ -656,6 +954,12 @@ table2_rows = [
         "F1_Score": metrics_lr_wsv["F1_Score"],
         "MCC": metrics_lr_wsv["MCC"],
         "p_value_vs_Persistence": format_p_value(p_wsv),
+    },
+    {
+        "Model": "SVM (WSV only)",
+        "F1_Score": metrics_svm_wsv["F1_Score"],
+        "MCC": metrics_svm_wsv["MCC"],
+        "p_value_vs_Persistence": format_p_value(p_svm_wsv),
     },
     {
         "Model": "LR (Technical only)",
@@ -684,7 +988,7 @@ print(f"\nSaved LaTeX table to: {table_2_path}")
 # CONFUSION MATRICES
 # ============================================================
 
-print("\n[17/22] Confusion Matrices...")
+print("\n[22/25] Confusion Matrices...")
 
 fig, axes = plt.subplots(2, 3, figsize=(18, 12))
 
@@ -694,6 +998,7 @@ models_to_plot = [
     ('XGBoost (Fusion)', y_pred_xgb_fusion_test, 'Reds'),
     ('LR (WSV)', y_pred_lr_wsv_test, 'Oranges'),
     ('LR (Fusion)', y_pred_lr_fusion_test, 'Purples'),
+    ('SVM (WSV)', y_pred_svm_wsv_test, 'YlOrRd'),
 ]
 
 for idx, (name, y_pred, cmap) in enumerate(models_to_plot):
@@ -726,17 +1031,26 @@ print("      Saved: figure_confusion_matrices_all.png/.pdf")
 # ROC CURVES (ALL MODELS)
 # ============================================================
 
-print("\n[18/22] Generating ROC curves...")
+print("\n[23/25] Generating ROC curves...")
 
 fig, ax = plt.subplots(figsize=(10, 8))
 
 roc_models = [
-    ('XGB (Technical)', y_proba_xgb_tech_test, '#2E86AB'),
-    ('XGB (WSV)', y_proba_xgb_wsv_test, '#A23B72'),
-    ('XGB (Fusion)', y_proba_xgb_fusion_test, '#F18F01'),
-    ('LR (WSV)', y_proba_lr_wsv_test, '#A23B72'),
     ('LR (Fusion)', y_proba_lr_fusion_test, '#C73E1D'),
+    ('LR (WSV)', y_proba_lr_wsv_test, '#A23B72'),
+    ('SVM (WSV)', y_proba_svm_wsv_test, '#FF6B35'),
+    ('XGB (Fusion)', y_proba_xgb_fusion_test, '#F18F01'),
 ]
+
+# Add GARCH and HAR models if available
+if y_proba_garch is not None:
+    roc_models.append(('GARCH(1,1)', y_proba_garch, '#6A994E'))
+if y_proba_egarch is not None:
+    roc_models.append(('EGARCH(1,1)', y_proba_egarch, '#BC4749'))
+if y_proba_gjrgarch is not None:
+    roc_models.append(('GJR-GARCH', y_proba_gjrgarch, '#A7C957'))
+if y_proba_har is not None:
+    roc_models.append(('HAR', y_proba_har, '#8B5CF6'))
 
 for name, y_proba, color in roc_models:
     min_len = min(len(y_proba), len(y_test))
@@ -765,7 +1079,7 @@ print("      Saved: figure_roc_curves_all.png/.pdf")
 # MODEL COMPLEXITY VS PERFORMANCE
 # ============================================================
 
-print("\n[19/22] Generating model complexity analysis...")
+print("\n[24/25] Generating model complexity analysis...")
 
 # Define complexity scores (rough estimates)
 complexity_scores = {
@@ -814,7 +1128,7 @@ table_complexity.to_csv('/kaggle/working/modeling_tables/table_complexity_analys
 # FEATURE IMPORTANCE VISUALIZATION (THE "MONEY PLOT")
 # ============================================================
 
-print("\n[20/22] Feature Importance...")
+print("\n[25/25] Feature Importance...")
 
 def plot_feature_importance(model, feature_names, title="Feature Importance", save_name="feature_importance"):
     """Create horizontal bar chart of feature coefficients/importance."""
@@ -878,7 +1192,7 @@ if 'selected_features_list' in locals() and len(selected_features_list) > 0:
 # FAILURE ANALYSIS (CRITICAL FOR PAPER DISCUSSION)
 # ============================================================
 
-print("\n[21/22] Failure analysis (disabled for paper outputs)...")
+print("\n[24/25] Failure analysis (disabled for paper outputs)...")
 # NOTE: Failure analysis is disabled for the paper tables. To re-enable,
 # wrap the following logic in a function or remove the guard.
 if False:
@@ -917,7 +1231,7 @@ if False:
 # FINAL SUMMARY
 # ============================================================
 
-print("\n[22/22] Final Summary...")
+print("\n[27/25] Final Summary...")
 
 print("\n" + "="*80)
 print("MODELING COMPLETE")
