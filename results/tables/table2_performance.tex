@@ -1,9 +1,13 @@
-\begin{tabular}{lrrl}
+\begin{tabular}{lS[table-format=1.4]S[table-format=-1.4]l}
 \toprule
-Model & F1_Score & MCC & p_value_vs_Persistence \\
+\textbf{Model} & \textbf{F1} & \textbf{MCC} & \textbf{p-value} \\
 \midrule
-LR Fusion (Technical+WSV) & 0.600900 & 0.201800 & 0.001 \\
-LR (WSV only) & 0.559200 & 0.140800 & < 0.001*** \\
-LR (Technical only) & 0.475900 & 0.047900 & < 0.001*** \\
+LR Fusion & 0.6265 & 0.2666 & $<$ 0.001 \\
+LR (WSV) & 0.5928 & 0.2053 & $<$ 0.001 \\
+LR (Technical) & 0.4350 & -0.0014 & $<$ 0.001 \\
+\midrule
+Persistence & 0.4812 & -0.0376 & --- \\
+Random Classifier & 0.5030 & 0.0390 & --- \\
+Majority Class & 0.3956 & 0.0000 & --- \\
 \bottomrule
 \end{tabular}
